@@ -46,17 +46,17 @@ def read_log(path: str, default_year: int) -> List[Tuple[datetime, str, str]]:
     return out
 
 
-def sessions_by_gap(records: List[Tuple[datetime, str, str]], gap_seconds: int = 300, group_by_host: bool = True) -> List[List[str]]:
-    sessions: List[List[str]] = []
+def sessions_by_gap(records: List[Tuple[datetime, str, str]], gap_seconds: int = 300, group_by_host: bool = True) -> List[Tuple[List[str], Optional[str]]]:
+    sessions: List[Tuple[List[str], Optional[str]]] = []
     current: List[str] = []
     prev_ts: Optional[datetime] = None
     prev_host: Optional[str] = None
     gap = timedelta(seconds=gap_seconds)
 
     def flush():
-        nonlocal current
+        nonlocal current, prev_host
         if current:
-            sessions.append(current)
+            sessions.append((current, prev_host))
             current = []
 
     for ts, host, msg in records:
@@ -79,7 +79,7 @@ def sessions_by_gap(records: List[Tuple[datetime, str, str]], gap_seconds: int =
     return sessions
 
 
-def sessions_by_fixed_window(records: List[Tuple[datetime, str, str]], window_seconds: int = 300, step_seconds: Optional[int] = None, group_by_host: bool = True) -> List[List[str]]:
+def sessions_by_fixed_window(records: List[Tuple[datetime, str, str]], window_seconds: int = 300, step_seconds: Optional[int] = None, group_by_host: bool = True) -> List[Tuple[List[str], Optional[str]]]:
     if step_seconds is None:
         step_seconds = window_seconds
     # bucket per host
@@ -87,8 +87,8 @@ def sessions_by_fixed_window(records: List[Tuple[datetime, str, str]], window_se
     for ts, host, msg in records:
         buckets.setdefault(host if group_by_host else "__all__", []).append((ts, msg))
 
-    sessions: List[List[str]] = []
-    for _, recs in buckets.items():
+    sessions: List[Tuple[List[str], Optional[str]]] = []
+    for host_key, recs in buckets.items():
         recs.sort(key=lambda x: x[0])
         if not recs:
             continue
@@ -101,7 +101,7 @@ def sessions_by_fixed_window(records: List[Tuple[datetime, str, str]], window_se
             w_end = cur + w
             msgs = [msg for ts, msg in recs if cur <= ts < w_end]
             if msgs:
-                sessions.append(msgs)
+                sessions.append((msgs, host_key if group_by_host else None))
             cur += s
     return sessions
 
@@ -109,7 +109,8 @@ def sessions_by_fixed_window(records: List[Tuple[datetime, str, str]], window_se
 def main():
     in_path = os.environ.get("INPUT_LOG", "dataset/recent_unlabeled.log")
     out_csv = os.environ.get("OUTPUT_CSV", "dataset/unlabeled_sessions.csv")
-    year = int(os.environ.get("YEAR", datetime.now().year))
+    # Default to 2025 if YEAR not provided, but allow env override
+    year = int(os.environ.get("YEAR", 2025))
     mode = os.environ.get("MODE", "gap")
     group_by_host = os.environ.get("GROUP_BY_HOST", "true").lower() == "true"
     gap_seconds = int(os.environ.get("GAP_SECONDS", 300))
@@ -124,7 +125,8 @@ def main():
         sessions = sessions_by_fixed_window(records, window_seconds=window_seconds, step_seconds=step_seconds, group_by_host=group_by_host)
 
     df = pd.DataFrame({
-        "Content": [" ;-; ".join(s) for s in sessions]
+        "Content": [" ;-; ".join(s) for s, _ in sessions],
+        "Host": [h for _, h in sessions]
     })
     os.makedirs(os.path.dirname(out_csv), exist_ok=True)
     df.to_csv(out_csv, index=False)
@@ -134,4 +136,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

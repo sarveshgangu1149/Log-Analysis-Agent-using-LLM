@@ -1,4 +1,6 @@
 import os
+import csv
+import time
 from pathlib import Path
 import numpy as np
 import torch
@@ -10,13 +12,14 @@ from customDataset import CustomDataset, CustomCollator, BalancedSampler
 from torch import optim
 
 
-n_epochs_1 = 1
-n_epochs_2_1 = 1
-n_epochs_2_2 = 1
-n_epochs_3 = 2
+n_epochs_1 = int(os.environ.get('N_EPOCHS_1', 2))
+n_epochs_2_1 = int(os.environ.get('N_EPOCHS_2_1', 2))
+n_epochs_2_2 = int(os.environ.get('N_EPOCHS_2_2', 2))
+n_epochs_3 = int(os.environ.get('N_EPOCHS_3', 4))
 dataset_name = 'LOCAL'
-batch_size = 16
-micro_batch_size = 4
+batch_size = int(os.environ.get('BATCH_SIZE', 16))
+# Slightly larger micro-batch on MPS/CPU; override via env if needed
+micro_batch_size = int(os.environ.get('MICRO_BATCH_SIZE', 2))
 gradient_accumulation_steps = batch_size // micro_batch_size
 
 
@@ -24,23 +27,41 @@ lr_1 = 5e-4
 lr_2_1 = 5e-4
 lr_2_2 = 5e-5
 lr_3 = 5e-5
-max_content_len = 100
-max_seq_len = 128
+# Increase token budgets; override via env if needed
+max_content_len = int(os.environ.get('MAX_CONTENT_LEN', 96))
+max_seq_len = int(os.environ.get('MAX_SEQ_LEN', 96))
 
 # Use local CSV prepared from dataset/input_data.json
 data_path = str(Path(__file__).parent / 'dataset' / 'train.csv')
 
 min_less_portion = 0.3
 
-# Use local model folders bundled in the repo
+# Use local model folders; prefer TinyLlama if present, allow override via LLM_PATH
 ROOT_DIR = Path(__file__).parent
 Bert_path = str(ROOT_DIR / 'bert-base-uncased')
-Llama_path = str(ROOT_DIR / 'Meta-Llama-3-8B')
+_llm_env = os.environ.get('LLM_PATH')
+if _llm_env:
+    Llama_path = _llm_env
+else:
+    tiny_path = ROOT_DIR / 'TinyLlama-1.1B-Chat-v1.0'
+    llama3_path = ROOT_DIR / 'Meta-Llama-3-8B'
+    if tiny_path.exists():
+        Llama_path = str(tiny_path)
+    elif llama3_path.exists():
+        Llama_path = str(llama3_path)
+    else:
+        # fallback to TinyLlama name (user may download later)
+        Llama_path = str(tiny_path)
 
 ft_path = os.path.join(ROOT_DIR, r"ft_model_{}".format(dataset_name))
 
-# Auto-detect device; fall back to CPU
-device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+# Auto-detect device; prefer CUDA, then Apple MPS, else CPU
+if torch.cuda.is_available():
+    device = torch.device("cuda:0")
+elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+    device = torch.device("mps")
+else:
+    device = torch.device("cpu")
 
 print(f'n_epochs_1: {n_epochs_1}\n'
 f'n_epochs_2_1: {n_epochs_2_1}\n'
@@ -72,7 +93,7 @@ def print_number_of_trainable_model_parameters(model):
 
 
 
-def trainModel(model, dataloader, gradient_accumulation_steps, n_epochs, lr):
+def trainModel(model, dataloader, gradient_accumulation_steps, n_epochs, lr, phase_name: str):
     criterion = nn.CrossEntropyLoss(reduction='mean')
 
     trainable_model_params = print_number_of_trainable_model_parameters(model)
@@ -90,8 +111,17 @@ def trainModel(model, dataloader, gradient_accumulation_steps, n_epochs, lr):
     print(f'scheduler_step: {scheduler_step}')
 
     steps = 0
+    # Prepare simple CSV logger
+    runs_dir = Path(__file__).parent / 'runs'
+    runs_dir.mkdir(parents=True, exist_ok=True)
+    log_path = runs_dir / 'train_metrics.csv'
+    if not log_path.exists():
+        with open(log_path, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(['phase', 'epoch', 'loss', 'acc', 'last_lr', 'steps', 'samples'])
     for epoch in range(int(n_epochs)):
         total_acc, total_acc_count, total_count, train_loss = 0, 0, 0, 0
+        epoch_start = time.time()
 
         pbar = tqdm(dataloader, desc='Epoch {}/{}'.format(epoch, n_epochs))
         for i_th, bathc_i in enumerate(pbar):
@@ -105,7 +135,9 @@ def trainModel(model, dataloader, gradient_accumulation_steps, n_epochs, lr):
             seq_positions = seq_positions
 
             outputs, targets = model.train_helper(inputs, seq_positions, labels)
-
+            # MPS/CPU often require float32 for loss; ensure dtypes are correct
+            outputs = outputs.float()
+            targets = targets.long()
             loss = criterion(outputs, targets)
             loss = loss / gradient_accumulation_steps
 
@@ -147,6 +179,18 @@ def trainModel(model, dataloader, gradient_accumulation_steps, n_epochs, lr):
             print(f"[Epoch {epoch + 1:{len(str(n_epochs))}}/{n_epochs}] "
                   f"[loss: {train_loss_epoch:3f}]"
                   f"[acc: {train_acc_epoch:3f}]")
+            # Append epoch metrics
+            with open(log_path, 'a', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    phase_name,
+                    epoch + 1,
+                    f"{train_loss_epoch:.6f}",
+                    f"{train_acc_epoch:.6f}",
+                    f"{scheduler.get_last_lr()[0]:.8f}",
+                    steps,
+                    total_count,
+                ])
 
 if __name__ == '__main__':
     print(f'dataset: {data_path}')
@@ -158,18 +202,22 @@ if __name__ == '__main__':
     tokenizer = model.Bert_tokenizer
     collator = CustomCollator(tokenizer, max_seq_len=max_seq_len, max_content_len=max_content_len)
 
+    # For small datasets, cap sampler size to dataset size to avoid errors
+    max_samples_phase1 = min(1000, len(dataset))
+    num_workers = int(os.environ.get('NUM_WORKERS', 2))
+
     dataloader_max_samples = DataLoader(
         dataset,
         batch_size=micro_batch_size,
-        num_workers=4,
-        sampler=BalancedSampler(dataset, target_ratio=min_less_portion, max_samples=1000),
+        num_workers=num_workers,
+        sampler=BalancedSampler(dataset, target_ratio=min_less_portion, max_samples=max_samples_phase1),
         collate_fn=collator,
         drop_last=True
     )
     # phase 1
     print("*" * 10 + "Start training Llama" + "*" * 10)
     model.set_train_only_Llama()
-    trainModel(model, dataloader_max_samples, gradient_accumulation_steps, n_epochs_1, lr_1)
+    trainModel(model, dataloader_max_samples, gradient_accumulation_steps, n_epochs_1, lr_1, phase_name='phase1_llama')
     del dataloader_max_samples
 
     # Limit samples for small custom datasets to avoid huge epoch sizes
@@ -179,7 +227,7 @@ if __name__ == '__main__':
     dataloader = DataLoader(
         dataset,
         batch_size=micro_batch_size,
-        num_workers=4,
+        num_workers=num_workers,
         sampler=BalancedSampler(dataset, target_ratio=min_less_portion, max_samples=max_samples_phase2),
         collate_fn=collator,
         drop_last=True
@@ -187,14 +235,14 @@ if __name__ == '__main__':
     # phase 2-1
     print("*" * 10 + "Start training projector" + "*" * 10)
     model.set_train_only_projector()
-    trainModel(model, dataloader, gradient_accumulation_steps, n_epochs_2_1, lr_2_1)
+    trainModel(model, dataloader, gradient_accumulation_steps, n_epochs_2_1, lr_2_1, phase_name='phase2_projector')
     # phase 2-2
     print("*" * 10 + "Start training projector and Bert" + "*" * 10)
     model.set_train_projectorAndBert()
-    trainModel(model, dataloader, gradient_accumulation_steps, n_epochs_2_2, lr_2_2)
+    trainModel(model, dataloader, gradient_accumulation_steps, n_epochs_2_2, lr_2_2, phase_name='phase2_proj_bert')
     # phase 3
     model.set_finetuning_all()
     print("*" * 10 + "Start training entire model" + "*" * 10)
-    trainModel(model, dataloader, gradient_accumulation_steps, n_epochs_3, lr_3)
+    trainModel(model, dataloader, gradient_accumulation_steps, n_epochs_3, lr_3, phase_name='phase3_full')
 
     model.save_ft_model(ft_path)

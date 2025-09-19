@@ -55,10 +55,26 @@ def main():
 
     root = Path(__file__).parent
     bert_path = str(root / 'bert-base-uncased')
-    llama_path = str(root / 'Meta-Llama-3-8B')
+    _llm_env = os.environ.get('LLM_PATH')
+    if _llm_env:
+        llama_path = _llm_env
+    else:
+        tiny_path = root / 'TinyLlama-1.1B-Chat-v1.0'
+        llama3_path = root / 'Meta-Llama-3-8B'
+        if tiny_path.exists():
+            llama_path = str(tiny_path)
+        elif llama3_path.exists():
+            llama_path = str(llama3_path)
+        else:
+            llama_path = str(tiny_path)
     dataset_name = os.environ.get('DATASET_NAME', 'LOCAL')
     ft_path = os.path.join(root, f"ft_model_{dataset_name}")
-    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+    if torch.cuda.is_available():
+        device = torch.device('cuda:0')
+    elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+        device = torch.device('mps')
+    else:
+        device = torch.device('cpu')
 
     ds = InferenceDataset(input_csv)
     # Build a collator with the same tokenizer as training will use
@@ -77,6 +93,8 @@ def main():
     out_df = inp_df.copy()
     out_df['PredictedText'] = pred_text
     out_df['PredictedLabel'] = pred_label
+    # Simple confidence proxy: 1.0 when we parsed explicit normal/anomalous, else 0.0
+    out_df['Confidence'] = [1.0 if t in ('normal','anomalous') else 0.0 for t in pred_text]
     os.makedirs(os.path.dirname(output_csv), exist_ok=True)
     out_df.to_csv(output_csv, index=False)
     print(f"Wrote predictions for {len(out_df)} sessions → {output_csv}")

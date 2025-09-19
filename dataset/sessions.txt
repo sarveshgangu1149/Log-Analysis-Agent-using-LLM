@@ -1,14 +1,14 @@
-SESSION 1
+SESSION 1 
 Jul 27 18:04:39 scaqat02adm01 systemd-modules-load[4931]: Failed to find module 'rds_rdma'
 Jul 27 18:04:39 scaqat02adm01 systemd[1]: rdma-load-modules@rdma.service: Failed with result 'exit-code'.
 Jul 27 18:04:39 scaqat02adm01 systemd[1]: Failed to start Load RDMA modules from /etc/rdma/modules/rdma.conf.
+LABEL : 1
 
 SESSION 2
 Jul 28 00:43:48 localhost dbus-daemon[72064]: [system] Activation via systemd failed for unit 'dbus-org.freedesktop.nm-dispatcher.service': Unit dbus-org.freedesktop.nm-dispatcher.service not found.
 Jul 28 00:43:48 localhost dbus-daemon[72064]: [system] Activation via systemd failed for unit 'dbus-org.freedesktop.nm-dispatcher.service': Unit dbus-org.freedesktop.nm-dispatcher.service not found.
-Jul 28 00:43:49 localhost dbus-daemon[72064]: [system] Activation via systemd failed for unit 'dbus-org.freedesktop.nm-dispatcher.service': Unit dbus-org.freedesktop.nm-dispatcher.service not found.
-Jul 28 00:43:49 localhost dbus-daemon[72064]: [system] Activation via systemd failed for unit 'dbus-org.freedesktop.nm-dispatcher.service': Unit dbus-org.freedesktop.nm-dispatcher.service not found.
-Jul 28 00:43:49 localhost dbus-daemon[72064]: [system] Activation via systemd failed for unit 'dbus-org.freedesktop.nm-dispatcher.service': Unit dbus-org.freedesktop.nm-dispatcher.service not found.
+LABEL : -1
+
 
 
 

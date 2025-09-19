@@ -75,8 +75,8 @@ def sessions_by_gap(
     drop_label_neg1: bool = False,
     map_neg1_to: int = 0,
     keep_unknown_sessions: bool = True,
-) -> List[Tuple[List[str], Optional[int]]]:
-    sessions: List[Tuple[List[str], Optional[int]]] = []
+) -> List[Tuple[List[str], Optional[int], Optional[str]]]:
+    sessions: List[Tuple[List[str], Optional[int], Optional[str]]] = []
     current_msgs: List[str] = []
     current_labels_raw: List[int] = []  # keep original labels {-1,0,1}
     prev_ts: Optional[datetime] = None
@@ -99,7 +99,7 @@ def sessions_by_gap(
         else:
             # default to normal if no signal
             sess_label = 0
-        sessions.append((current_msgs, sess_label))
+        sessions.append((current_msgs, sess_label, prev_host))
         current_msgs, current_labels_raw = [], []
 
     for r in records:
@@ -139,7 +139,7 @@ def sessions_by_fixed_window(
     drop_label_neg1: bool = False,
     map_neg1_to: int = 0,
     keep_unknown_sessions: bool = True,
-) -> List[Tuple[List[str], Optional[int]]]:
+) -> List[Tuple[List[str], Optional[int], Optional[str]]]:
     if step_seconds is None:
         step_seconds = window_seconds
 
@@ -148,8 +148,8 @@ def sessions_by_fixed_window(
     for r in records:
         buckets.setdefault(r.host if group_by_host else "__all__", []).append(r)
 
-    sessions: List[Tuple[List[str], Optional[int]]] = []
-    for _, recs in buckets.items():
+    sessions: List[Tuple[List[str], Optional[int], Optional[str]]] = []
+    for host_key, recs in buckets.items():
         recs.sort(key=lambda x: x.ts)
         if not recs:
             continue
@@ -181,7 +181,7 @@ def sessions_by_fixed_window(
                     sess_label = None
                 else:
                     sess_label = 0
-                sessions.append((msgs, sess_label))
+                sessions.append((msgs, sess_label, host_key if group_by_host else None))
             cur += s
     return sessions
 
@@ -199,7 +199,8 @@ def main():
     # Inputs and options via env vars for convenience
     in_path = os.environ.get("INPUT_LOG", "dataset/raw_log_1_labeled.log")
     out_dir = os.environ.get("OUTPUT_DIR", "dataset")
-    year = int(os.environ.get("YEAR", datetime.now().year))
+    # Default to 2025 if YEAR not provided, but allow env override
+    year = int(os.environ.get("YEAR", 2025))
     mode = os.environ.get("MODE", "gap")  # gap | fixed
     group_by_host = os.environ.get("GROUP_BY_HOST", "true").lower() == "true"
     drop_label_neg1 = os.environ.get("DROP_LABEL_NEG1", "false").lower() == "true"
@@ -209,6 +210,7 @@ def main():
     step_seconds = os.environ.get("STEP_SECONDS")
     step_seconds = int(step_seconds) if step_seconds is not None else None
     train_ratio = float(os.environ.get("TRAIN_RATIO", 0.8))
+    stratified = os.environ.get("STRATIFIED_SPLIT", "false").lower() == "true"
 
     records = read_labeled_log(in_path, default_year=year)
     if mode == "gap":
@@ -232,26 +234,56 @@ def main():
         )
 
     # Separate labeled vs unknown sessions
-    labeled = [(msgs, int(lbl)) for msgs, lbl in sessions if lbl is not None]
-    unknown = [msgs for msgs, lbl in sessions if lbl is None]
+    labeled = [(msgs, int(lbl), host) for msgs, lbl, host in sessions if lbl is not None]
+    unknown = [(msgs, host) for msgs, lbl, host in sessions if lbl is None]
 
-    # Split train/test chronologically by session order (only labeled ones)
-    split = int(len(labeled) * train_ratio)
-    train_sessions = labeled[:split]
-    test_sessions = labeled[split:]
+    # Split train/test (only labeled ones)
+    if stratified:
+        # Keep label ratios similar in train and test while preserving chronological order within each class
+        labeled_with_idx = [(i, s[0], s[1], s[2]) for i, s in enumerate(labeled)]  # (orig_idx, msgs, label, host)
+        pos = [x for x in labeled_with_idx if x[2] == 1]
+        neg = [x for x in labeled_with_idx if x[2] == 0]
 
-    write_csv(train_sessions, os.path.join(out_dir, "train.csv"))
-    write_csv(test_sessions, os.path.join(out_dir, "test.csv"))
+        n_train_pos = int(len(pos) * train_ratio)
+        n_train_neg = int(len(neg) * train_ratio)
+
+        train_idx = set([i for (i, _, _, _) in pos[:n_train_pos]] + [i for (i, _, _, _) in neg[:n_train_neg]])
+
+        train_sessions = [(msgs, int(lbl), host) for (i, msgs, lbl, host) in labeled_with_idx if i in train_idx]
+        test_sessions = [(msgs, int(lbl), host) for (i, msgs, lbl, host) in labeled_with_idx if i not in train_idx]
+    else:
+        # Chronological split by session order
+        split = int(len(labeled) * train_ratio)
+        train_sessions = labeled[:split]
+        test_sessions = labeled[split:]
+
+    # Write labeled with Host column
+    df_train = pd.DataFrame({
+        'Content': [" ;-; ".join(x[0]) for x in train_sessions],
+        'Label': [x[1] for x in train_sessions],
+        'Host': [x[2] for x in train_sessions],
+    })
+    df_test = pd.DataFrame({
+        'Content': [" ;-; ".join(x[0]) for x in test_sessions],
+        'Label': [x[1] for x in test_sessions],
+        'Host': [x[2] for x in test_sessions],
+    })
+    os.makedirs(out_dir, exist_ok=True)
+    df_train.to_csv(os.path.join(out_dir, 'train.csv'), index=False)
+    df_test.to_csv(os.path.join(out_dir, 'test.csv'), index=False)
 
     # Write unknown sessions for later pseudo-labeling/inference
     if unknown:
         df_unknown = pd.DataFrame({
-            "Content": [" ;-; ".join(s) for s in unknown]
+            "Content": [" ;-; ".join(s) for s, _ in unknown],
+            "Host": [h for _, h in unknown]
         })
         df_unknown.to_csv(os.path.join(out_dir, "unlabeled_sessions.csv"), index=False)
 
     print(f"Read {len(records)} labeled messages from {in_path}")
     print(f"Built {len(sessions)} sessions (mode={mode}, group_by_host={group_by_host})")
+    if stratified:
+        print("Using STRATIFIED_SPLIT=true: preserved label ratios in train/test.")
     print(f"Labeled sessions: {len(labeled)}, Unknown sessions: {len(unknown)}")
     print(f"Wrote {len(train_sessions)} train sessions → {os.path.join(out_dir, 'train.csv')}")
     print(f"Wrote {len(test_sessions)} test sessions → {os.path.join(out_dir, 'test.csv')}")

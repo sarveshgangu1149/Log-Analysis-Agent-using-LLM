@@ -2,6 +2,7 @@ import os.path
 
 import peft
 import torch
+import torch.nn.functional as F
 from transformers import BertTokenizerFast, BertModel, BitsAndBytesConfig, AutoTokenizer, AutoModelForCausalLM, DynamicCache
 import numpy as np
 from torch import nn
@@ -76,12 +77,9 @@ def stack_and_pad_left(tensors):
 
     return stacked_tensor, padding_masks
 
-bnb_config = BitsAndBytesConfig(
-    load_in_4bit=True,  # load the model into memory using 4-bit precision
-    bnb_4bit_use_double_quant=False,  # use double quantition
-    bnb_4bit_quant_type="nf4",  # use NormalFloat quantition
-    bnb_4bit_compute_dtype=torch.bfloat16  # use hf for computing when we need
-)
+# Do NOT instantiate BitsAndBytesConfig globally. On non-CUDA systems without
+# bitsandbytes installed, its post_init() tries to resolve the package version
+# and raises. We construct it lazily only when running on CUDA.
 
 class LogLLM(nn.Module):
     def __init__(self, Bert_path, Llama_path, ft_path=None, is_train_mode=True, device = torch.device("cuda:0"), max_content_len = 128, max_seq_len = 128):
@@ -91,15 +89,53 @@ class LogLLM(nn.Module):
         self.device = device
         self.Llama_tokenizer = AutoTokenizer.from_pretrained(Llama_path, padding_side="right")
         self.Llama_tokenizer.pad_token = self.Llama_tokenizer.eos_token
-        self.Llama_model = AutoModelForCausalLM.from_pretrained(Llama_path, quantization_config=bnb_config,
-                                                           low_cpu_mem_usage=True,
-                                                           device_map=device)  # embedding dim = 4096
+        # Device/quantization handling: use 4-bit only on CUDA; fall back to float16 on MPS or float32 on CPU.
+        use_cuda = isinstance(device, torch.device) and device.type == 'cuda'
+        use_mps = (not use_cuda) and torch.backends.mps.is_available() and (isinstance(device, torch.device) and device.type == 'mps')
+
+        if use_cuda:
+            bnb_config = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_use_double_quant=False,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_compute_dtype=torch.bfloat16,
+            )
+            self.Llama_model = AutoModelForCausalLM.from_pretrained(
+                Llama_path,
+                quantization_config=bnb_config,
+                low_cpu_mem_usage=True,
+                device_map='auto',  # let HF shard to GPUs
+            )
+        else:
+            self.Llama_model = AutoModelForCausalLM.from_pretrained(
+                Llama_path,
+                torch_dtype=torch.float32,  # prefer fp32 on MPS/CPU for stability
+                low_cpu_mem_usage=True,
+            )
+            self.Llama_model.to(self.device)
 
         self.Bert_tokenizer = BertTokenizerFast.from_pretrained(Bert_path, do_lower_case=True)
-        self.Bert_model = BertModel.from_pretrained(Bert_path, quantization_config=bnb_config, low_cpu_mem_usage=True,
-                                               device_map=device)
+        if use_cuda:
+            bnb_config = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_use_double_quant=False,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_compute_dtype=torch.bfloat16,
+            )
+            self.Bert_model = BertModel.from_pretrained(
+                Bert_path,
+                quantization_config=bnb_config,
+                low_cpu_mem_usage=True,
+                device_map='auto',
+            )
+        else:
+            self.Bert_model = BertModel.from_pretrained(
+                Bert_path,
+                low_cpu_mem_usage=True,
+            )
+            self.Bert_model.to(self.device)
 
-        self.projector = nn.Linear(self.Bert_model.config.hidden_size, self.Llama_model.config.hidden_size, device=device)
+        self.projector = nn.Linear(self.Bert_model.config.hidden_size, self.Llama_model.config.hidden_size, device=self.device)
         # self.projector = nn.Linear(self.Bert_model.config.hidden_size, self.Llama_model.config.hidden_size).half().to(device)
 
         self.instruc_tokens = self.Llama_tokenizer(
@@ -208,7 +244,9 @@ class LogLLM(nn.Module):
         outputs = self.Bert_model(**inputs).pooler_output  # dim = 768
         outputs = outputs.float()
         outputs = self.projector(outputs)
-        outputs = outputs.half()
+        # match LLaMA dtype to avoid mixed-precision issues on MPS/CPU
+        llama_dtype = next(self.Llama_model.parameters()).dtype
+        outputs = outputs.to(llama_dtype)
 
         seq_embeddings = torch.tensor_split(outputs, seq_positions)
 
@@ -254,6 +292,75 @@ class LogLLM(nn.Module):
 
         return Llama_output[label_mask], target_tokens_ids[target_tokens_atts]
 
+    def score_candidates(self, inputs, seq_positions, candidates=("normal", "anomalous")):
+        """
+        Compute per-sample log-likelihood sums for candidate answers.
+        Returns a tensor of shape [batch, len(candidates)], where higher is better.
+        """
+        # Encode lines with BERT and project to LLaMA space
+        outputs = self.Bert_model(**inputs).pooler_output  # [N_lines, 768]
+        outputs = outputs.float()
+        outputs = self.projector(outputs)
+        llama_dtype = next(self.Llama_model.parameters()).dtype
+        outputs = outputs.to(llama_dtype)
+
+        seq_embeddings = torch.tensor_split(outputs, seq_positions)
+
+        # Instruction embeddings (two parts as in train_helper)
+        if type(self.Llama_model) == peft.peft_model.PeftModelForCausalLM:
+            instruc_embeddings = self.Llama_model.model.model.embed_tokens(self.instruc_tokens['input_ids'])
+        else:
+            instruc_embeddings = self.Llama_model.model.embed_tokens(self.instruc_tokens['input_ids'])
+        ins1 = instruc_embeddings[0][self.instruc_tokens['attention_mask'][0].bool()]
+        ins2 = instruc_embeddings[1][self.instruc_tokens['attention_mask'][1].bool()][1:]
+
+        batch_size = len(seq_embeddings)
+        scores = []
+        for cand in candidates:
+            answer = f"The sequence is {cand}."
+            answer_tokens = self.Llama_tokenizer([answer], padding=True, return_tensors="pt").to(self.device)
+            # remove BOS
+            ans_ids = answer_tokens['input_ids'][:, 1:]
+            ans_att = answer_tokens['attention_mask'].bool()[:, 1:]
+
+            # Get embeddings for answer tokens
+            if type(self.Llama_model) == peft.peft_model.PeftModelForCausalLM:
+                ans_emb = self.Llama_model.model.model.embed_tokens(ans_ids)
+            else:
+                ans_emb = self.Llama_model.model.embed_tokens(ans_ids)
+
+            cand_embeddings = []
+            for seq_emb in seq_embeddings:
+                cand_embeddings.append(torch.cat([ins1, seq_emb, ins2, ans_emb[0][ans_att[0]]]))
+
+            inputs_embeds, attention_mask = stack_and_pad_left(cand_embeddings)
+            attention_mask = attention_mask.to(self.device)
+
+            # label mask: last K positions are the answer tokens
+            K = int(ans_att.sum().item())
+            label_mask = attention_mask.clone()
+            for i in range(label_mask.shape[0]):
+                label_mask[i, :-K] = 0
+            label_mask = label_mask.bool()
+
+            # Forward and compute logprobs over answer tokens
+            logits = self.Llama_model(inputs_embeds=inputs_embeds, attention_mask=attention_mask).logits
+            logp = F.log_softmax(logits, dim=-1)
+            # Gather target token ids repeated for batch
+            target_ids = ans_ids[0][:, None].repeat(1, 1).squeeze(1)  # shape [K]
+            # Accumulate per-sample score
+            per_sample = []
+            for i in range(batch_size):
+                mask_i = label_mask[i]
+                # select last K positions
+                logp_i = logp[i][mask_i]  # [K, V]
+                # Gather logp at target ids
+                token_logp = logp_i.gather(1, target_ids.view(-1, 1)).squeeze(1)  # [K]
+                per_sample.append(token_logp.sum())
+            scores.append(torch.stack(per_sample))
+
+        return torch.stack(scores, dim=1)  # [batch, num_candidates]
+
     def forward(self, inputs, seq_positions):
         '''
         :param inputs: the tokenized Sequences for BERT. Sequences are concatenated.
@@ -265,7 +372,8 @@ class LogLLM(nn.Module):
         outputs = self.Bert_model(**inputs).pooler_output  # dim = 768
         outputs = outputs.float()
         outputs = self.projector(outputs)
-        outputs = outputs.half()
+        llama_dtype = next(self.Llama_model.parameters()).dtype
+        outputs = outputs.to(llama_dtype)
 
         seq_embeddings = torch.tensor_split(outputs, seq_positions)
 
